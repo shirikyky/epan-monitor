@@ -12,6 +12,11 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: 'Force a failure, to test the alert path'
+        type: boolean
+        default: false
 
 permissions:
   issues: write
@@ -26,6 +31,9 @@ jobs:
         run: |
           set -u
           fail=""
+          if [ "${{ inputs.simulate_failure }}" = "true" ]; then
+            fail="בדיקת מסלול ההתראה (הרצה ידנית)"
+          fi
           code=$(curl -sS -o /tmp/page.html -w '%{http_code}' --max-time 30 -L \
                  https://everypaintinghasaname.com/ 2>/dev/null || echo 000)
           if [ "$code" != "200" ]; then
