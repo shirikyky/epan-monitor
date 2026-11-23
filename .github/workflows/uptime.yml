@@ -2,17 +2,26 @@ name: uptime
 
 # External watchdog for https://everypaintinghasaname.com
 #
-# Runs from GitHub's cloud, NOT from the site's own server — so it still fires when
-# the server itself is down (the on-server watchdogs cannot). While the site is
-# healthy this job is silent. When it fails it opens an issue labelled "uptime",
-# which GitHub emails to the repository owner; the issue closes itself once the
-# site answers again.
+# Runs from GitHub's cloud, NOT from the site's own server, so it still fires when
+# the server itself is down (the on-server watchdogs cannot).
+#
+# WHY A LOOP: GitHub heavily throttles `schedule:` crons on free/public repos — a
+# "*/10 * * * *" cron actually fired only 2-3 times a DAY here. So instead one job
+# is started every 6 hours and the job itself probes the site every 5 minutes for
+# the rest of its ~5h40m window. Public repos get unlimited Actions minutes, so
+# this costs nothing and gives near-continuous coverage.
+#
+# While the site is healthy it is silent. On failure it opens an issue labelled
+# "uptime" (GitHub emails the owner) and closes it again once the site recovers.
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '5 */6 * * *'
   workflow_dispatch:
     inputs:
+      minutes:
+        description: 'How long to watch (minutes)'
+        default: '15'
       simulate_failure:
         description: 'Force a failure, to test the alert path'
         type: boolean
@@ -23,76 +32,77 @@ permissions:
   contents: write
 
 jobs:
-  check:
+  watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
-      - name: Probe the site
-        id: probe
+      - name: Watch the site
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIMULATE: ${{ inputs.simulate_failure }}
+          MINUTES: ${{ inputs.minutes }}
         run: |
           set -u
-          fail=""
-          if [ "${{ inputs.simulate_failure }}" = "true" ]; then
-            fail="בדיקת מסלול ההתראה (הרצה ידנית)"
-          fi
-          code=$(curl -sS -o /tmp/page.html -w '%{http_code}' --max-time 30 -L \
-                 https://everypaintinghasaname.com/ 2>/dev/null || echo 000)
-          if [ "$code" != "200" ]; then
-            fail="האתר לא מגיב (HTTP $code)"
-          elif ! grep -q 'assets/app.js' /tmp/page.html; then
-            fail="האתר מגיב אבל התוכן אינו שלנו"
-          fi
-          dns=$(dig +short A everypaintinghasaname.com @1.1.1.1 2>/dev/null | head -1)
-          case "$dns" in
-            104.*|172.6*|172.7*|188.114.*|162.15*|131.0.*) ;;
-            "") fail="${fail:+$fail · }הדומיין לא מתפענח" ;;
-            *)  fail="${fail:+$fail · }הדומיין מצביע ל-$dns במקום ל-Cloudflare" ;;
-          esac
-          echo "fail=$fail" >> "$GITHUB_OUTPUT"
-          echo "result: [${fail:-OK}]"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          WATCH_MIN="${MINUTES:-340}"           # a scheduled run watches ~5h40m
+          INTERVAL=300                          # probe every 5 minutes
+          END=$(( $(date +%s) + WATCH_MIN * 60 ))
+          JQ_OPEN='import json,sys; print(" ".join(str(i["number"]) for i in json.load(sys.stdin)))'
+          JQ_LEN='import json,sys; print(len(json.load(sys.stdin)))'
+          JQ_BODY='import json,sys; print(json.dumps({"title":sys.argv[1],"body":sys.argv[2],"labels":["uptime"]},ensure_ascii=False))'
 
-      - name: Open or close the alert issue
-        uses: actions/github-script@v7
-        env:
-          FAIL: ${{ steps.probe.outputs.fail }}
-        with:
-          script: |
-            const fail = (process.env.FAIL || '').trim();
-            const { owner, repo } = context.repo;
-            const open = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: 'uptime'
-            });
-            const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
-            if (fail && open.data.length === 0) {
-              await github.rest.issues.create({
-                owner, repo, labels: ['uptime'],
-                title: `🔴 האתר לא זמין — ${stamp} UTC`,
-                body: [
-                  'בדיקה אוטומטית **מהענן של GitHub** (לא מהשרת של האתר).',
-                  '',
-                  `**${fail}**`,
-                  '',
-                  `- האתר: https://everypaintinghasaname.com/`,
-                  `- זמן הבדיקה: ${new Date().toISOString()}`,
-                  '',
-                  '_ההתראה נוספה אוטומטית ותיסגר מעצמה כשהאתר יחזור לענות._'
-                ].join('\n')
-              });
-            } else if (!fail && open.data.length > 0) {
-              for (const issue of open.data) {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: issue.number,
-                  body: `✅ האתר חזר להיות זמין — ${new Date().toISOString()}`
-                });
-                await github.rest.issues.update({
-                  owner, repo, issue_number: issue.number, state: 'closed'
-                });
-              }
-            }
+          open_numbers() {
+            curl -sS -H "$AUTH" "$API/issues?state=open&labels=uptime&per_page=100" \
+              | python3 -c "$JQ_OPEN" 2>/dev/null || true
+          }
+
+          while :; do
+            fail=""
+            if [ "${SIMULATE:-false}" = "true" ]; then
+              fail="בדיקת מסלול ההתראה (הרצה ידנית)"
+            fi
+            code=$(curl -sS -o /tmp/page.html -w '%{http_code}' --max-time 25 -L \
+                   https://everypaintinghasaname.com/ 2>/dev/null || echo 000)
+            if [ "$code" != "200" ]; then
+              fail="${fail:+$fail · }האתר לא מגיב (HTTP $code)"
+            elif ! grep -q 'assets/app.js' /tmp/page.html; then
+              fail="${fail:+$fail · }האתר מגיב אבל התוכן אינו שלנו"
+            fi
+            dns=$(dig +short A everypaintinghasaname.com @1.1.1.1 2>/dev/null | head -1)
+            case "$dns" in
+              104.*|172.6*|172.7*|188.114.*|162.15*|131.0.*) ;;
+              "") fail="${fail:+$fail · }הדומיין לא מתפענח" ;;
+              *)  fail="${fail:+$fail · }הדומיין מצביע ל-$dns במקום ל-Cloudflare" ;;
+            esac
+
+            stamp=$(date -u '+%Y-%m-%d %H:%M UTC')
+            echo "$stamp  ${fail:-OK}"
+            nums=$(open_numbers)
+            if [ -n "$fail" ] && [ -z "$nums" ]; then
+              body=$(printf 'בדיקה אוטומטית **מהענן של GitHub** (לא מהשרת של האתר).\n\n**%s**\n\n- האתר: https://everypaintinghasaname.com/\n- זמן הבדיקה: %s\n- הבדיקה חוזרת כל 5 דקות, וה-Issue ייסגר מעצמו כשהאתר יחזור.' "$fail" "$stamp")
+              curl -sS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                -d "$(python3 -c "$JQ_BODY" "🔴 האתר לא זמין — $stamp" "$body")" \
+                "$API/issues" > /dev/null
+            elif [ -z "$fail" ] && [ -n "$nums" ]; then
+              for num in $nums; do
+                curl -sS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                  -d "{\"body\":\"✅ האתר חזר להיות זמין — $stamp\"}" \
+                  "$API/issues/$num/comments" > /dev/null
+                curl -sS -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
+                  -d '{"state":"closed"}' "$API/issues/$num" > /dev/null
+              done
+            fi
+
+            now=$(date +%s)
+            [ "$now" -ge "$END" ] && break
+            sleep $INTERVAL
+          done
 
       # GitHub disables scheduled workflows in repositories with no activity for
       # 60 days. One tiny commit a month keeps the watchdog armed.
       - name: Monthly keep-alive
-        if: github.event_name == 'schedule' && github.event.schedule == '*/10 * * * *'
+        if: github.event_name == 'schedule'
         run: |
           if [ "$(date -u +%d)" != "01" ]; then exit 0; fi
           git config user.name  "uptime-watchdog"
